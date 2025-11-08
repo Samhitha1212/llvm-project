@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <iostream>
 #include "X86ISelLowering.h"
 #include "MCTargetDesc/X86ShuffleDecode.h"
 #include "X86.h"
@@ -19,6 +20,7 @@
 #include "X86IntrinsicsInfo.h"
 #include "X86MachineFunctionInfo.h"
 #include "X86TargetMachine.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -57366,12 +57368,320 @@ static SDValue combineFPToSInt(SDNode *N, SelectionDAG &DAG,
                                const X86Subtarget &Subtarget) {
   EVT VT = N->getValueType(0);
   SDValue Src = N->getOperand(0);
+  std::cout<<"entered"<<std::endl;
+    if (const ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(Src)) {
+      std::cout<<"entered2"<<std::endl;
+      const APFloat &APF = CFP->getValueAPF();
+      if (APF.isNaN() || APF.isInfinity())
+        return SDValue(); // can't fold NaN/Inf
+
+      unsigned Width = VT.getScalarSizeInBits(); // e.g. 32 or 64
+      bool IsSigned = true; // FP_TO_SINT -> signed conversion
+      APFloat::roundingMode RM = APFloat::rmTowardZero; // truncating semantics for casts
+
+      // Use APSInt (APSInt = APInt + signedness)
+      APSInt ResultAPSInt(Width, /*isUnsigned=*/!IsSigned);
+
+      bool IsExact = false;
+      APFloat APFcopy = APF;
+
+      // Use APSInt overload: convertToInteger(APSInt&, roundingMode, bool*)
+      APFloat::opStatus Status = APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact);
+
+      if (Status == APFloat::opOK) {
+        // Only handle results that fit into <= 64 bits here (common scalar sizes).
+        std::cout<<"width"<<Width<<std::endl;
+        if (Width <= 64) {
+          uint64_t Val = IsSigned ? ResultAPSInt.getSExtValue()
+                                  : ResultAPSInt.getZExtValue();
+          std::cout<<"node"<<std::endl;
+          
+          return DAG.getConstant(Val, SDLoc(N), VT);
+        }
+
+        // For >64-bit widths: skip folding for now (implement later if needed).
+        return SDValue();
+      }
+    }
+
+      
   if (Subtarget.hasSSE2() && Src.getOpcode() == ISD::FRINT &&
       VT.getScalarType() == MVT::i32 && Src.hasOneUse())
     return DAG.getNode(ISD::LRINT, SDLoc(N), VT, Src.getOperand(0));
 
   return SDValue();
 }
+
+static SDValue combineCVTTS2UI(SDNode *N, SelectionDAG &DAG, const X86Subtarget &Subtarget){
+  EVT VT = N->getValueType(0);
+  SDValue Src = N->getOperand(0);
+  std::cout<<"entereddd"<<std::endl;
+   // --- Direct constant float ---
+  if (const ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(Src)) {
+  std::cout<<"entereddd2"<<std::endl;
+
+    const APFloat &APF = CFP->getValueAPF();
+    if (APF.isNaN() || APF.isInfinity())
+      return SDValue(); // Can't fold NaN/Inf
+
+    unsigned Width = VT.getScalarSizeInBits();
+    APFloat::roundingMode RM = APFloat::rmTowardZero; // truncation semantics
+
+    APSInt ResultAPSInt(Width, /*isUnsigned=*/true);
+    bool IsExact = false;
+    APFloat APFcopy = APF;
+
+    APFloat::opStatus Status = APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact);
+    if (Status == APFloat::opOK) {
+      uint64_t Val = ResultAPSInt.getZExtValue();
+      LLVM_DEBUG(dbgs() << "Folding float constant to unsigned int: " << Val << "\n");
+      return DAG.getConstant(Val, SDLoc(N), VT);
+    }
+  }
+
+  // --- Load from constant global (optional enhancement) ---
+  if (LoadSDNode *LD = dyn_cast<LoadSDNode>(Src)) {
+  std::cout<<"entereddd3"<<std::endl;
+
+    if (GlobalAddressSDNode *GA = dyn_cast<GlobalAddressSDNode>(LD->getBasePtr())) {
+      const GlobalVariable *GV = dyn_cast<GlobalVariable>(GA->getGlobal());
+      if (GV && GV->hasDefinitiveInitializer() && GV->isConstant()) {
+        if (const ConstantFP *CF = dyn_cast<ConstantFP>(GV->getInitializer())) {
+          const APFloat &APF = CF->getValueAPF();
+          if (APF.isNaN() || APF.isInfinity())
+            return SDValue();
+
+          unsigned Width = VT.getScalarSizeInBits();
+          APFloat::roundingMode RM = APFloat::rmTowardZero;
+          APSInt ResultAPSInt(Width, /*isUnsigned=*/true);
+          bool IsExact = false;
+          APFloat APFcopy = APF;
+
+          if (APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact) == APFloat::opOK) {
+            uint64_t Val = ResultAPSInt.getZExtValue();
+            LLVM_DEBUG(dbgs() << "Folded load from global float to " << Val << "\n");
+            return DAG.getConstant(Val, SDLoc(N), VT);
+          }
+        }
+      }
+    }
+  }
+
+  return SDValue(); // default - no foldin
+}
+
+// Static helper function to perform the constant folding
+static SDValue ConstantFoldX86FToI(SDNode *N, SelectionDAG &DAG) {
+    SDValue Src = N->getOperand(0);
+
+    // 1. Try to get the constant value if the node itself is a ConstantFPSDNode.
+    const ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(Src);
+
+    // 2. If it's a LOAD (Opcode 170), try to analyze the load's source address.
+    if (!CFP && Src.getOpcode() == ISD::LOAD) {
+        LoadSDNode *Ld = cast<LoadSDNode>(Src);
+
+        // Utility: Check if this load can be treated as a constant.
+        // If the load can be folded into a constant, this function returns the Constant*
+        if (Constant *C = DAG.getConstantUses().getConstantForLoad(Ld)) {
+            // Check if the constant is a floating point constant
+            if (const ConstantFP *CF = dyn_cast<ConstantFP>(C)) {
+                // If we found a ConstantFP, we can proceed with folding.
+                // Create a temporary ConstantFPSDNode to simplify the remaining logic.
+                CFP = cast<ConstantFPSDNode>(DAG.getConstantFP(CF->getValueAPF(), SDLoc(Ld), Ld->getValueType()));
+            }
+        }
+    }
+
+    // --- If CFP is still null after checking the load, return immediately. ---
+    if (!CFP)
+        return SDValue();
+        
+    std::cout<<"entereddd3"<<std::endl;
+    
+    // --- Continue with the rest of your successful folding logic from here, using CFP ---
+    const APFloat &APF = CFP->getValueAPF();
+    if (APF.isNaN() || APF.isInfinity())
+        return SDValue();
+
+    EVT VT = N->getValueType(0);
+    unsigned Width = VT.getScalarSizeInBits();
+    
+    // --- Determine Conversion Parameters based on Opcode ---
+    bool IsSigned;
+    APFloat::roundingMode RM;
+
+    switch (N->getOpcode()) {
+        case X86ISD::CVTTS2SI: // Standard Truncation to Signed
+        case X86ISD::CVTTS2SI_SAE:
+            IsSigned = true;
+            RM = APFloat::rmTowardZero;
+            break;
+        case X86ISD::CVTTS2UI: // Standard Truncation to Unsigned
+        case X86ISD::CVTTS2UI_SAE:
+            IsSigned = false;
+            RM = APFloat::rmTowardZero;
+            break;
+       case X86ISD::CVTS2SI_RND: 
+            IsSigned = true;
+            RM = APFloat::rmNearestTiesToEven; // Corrected name
+            break;
+      case X86ISD::CVTS2UI_RND: 
+          IsSigned = false;
+          RM = APFloat::rmNearestTiesToEven; // Corrected name
+          break;
+        // NOTE: For Saturation opcodes (CVTTS2SIS), you must also implement
+        // logic to check if the result would saturate (overflow/underflow) 
+        // and return the saturated value as a constant if safe. For simplicity,
+        // you can start by handling them identically to non-saturating.
+        default: 
+            return SDValue(); // Should not happen if called correctly
+    }
+    
+    // --- Perform Conversion and Check Safety ---
+    APSInt ResultAPSInt(Width, /*isUnsigned=*/!IsSigned);
+    bool IsExact = false;
+    APFloat APFcopy = APF;
+    
+    APFloat::opStatus Status = APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact);
+
+    // If conversion fails (overflow/underflow), we must NOT fold, as the runtime
+    // X86 instruction defines the behavior (e.g., clamping).
+    if (Status != APFloat::opOK) {
+        return SDValue(); 
+    }
+
+    // --- Return Constant Node ---
+    if (Width <= 64) {
+        // Use the appropriate getter for the APInt value
+        uint64_t Val = IsSigned ? ResultAPSInt.getSExtValue() : ResultAPSInt.getZExtValue();
+        return DAG.getConstant(Val, SDLoc(N), VT);
+    }
+    
+    return SDValue();
+}
+
+static SDValue combineCVTS2SI_RND(SDNode *N, SelectionDAG &DAG,
+                                  const X86Subtarget &Subtarget) {
+  EVT VT = N->getValueType(0);
+  SDValue Src = N->getOperand(0);
+
+  std::cout<<"entered signed round "<<std::endl;
+  // --- Direct constant float ---
+  if (const ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(Src)) {
+  std::cout<<"entered signed round2 "<<std::endl;
+
+    const APFloat &APF = CFP->getValueAPF();
+    if (APF.isNaN() || APF.isInfinity())
+      return SDValue(); // Can't fold NaN/Inf
+
+    unsigned Width = VT.getScalarSizeInBits();
+    APFloat::roundingMode RM = APFloat::rmNearestTiesToEven; // rounding semantics
+
+    APSInt ResultAPSInt(Width, /*isUnsigned=*/false);
+    bool IsExact = false;
+    APFloat APFcopy = APF;
+
+    APFloat::opStatus Status = APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact);
+    if (Status == APFloat::opOK) {
+      int64_t Val = ResultAPSInt.getSExtValue();
+      LLVM_DEBUG(dbgs() << "Folding float->int (round) constant: " << Val << "\n");
+      return DAG.getConstant(Val, SDLoc(N), VT);
+    }
+  }
+
+  // --- Load from constant global ---
+  if (LoadSDNode *LD = dyn_cast<LoadSDNode>(Src)) {
+  std::cout<<"entered signed round 3"<<std::endl;
+
+    if (GlobalAddressSDNode *GA = dyn_cast<GlobalAddressSDNode>(LD->getBasePtr())) {
+      const GlobalVariable *GV = dyn_cast<GlobalVariable>(GA->getGlobal());
+      if (GV && GV->hasDefinitiveInitializer() && GV->isConstant()) {
+        if (const ConstantFP *CF = dyn_cast<ConstantFP>(GV->getInitializer())) {
+          const APFloat &APF = CF->getValueAPF();
+          if (APF.isNaN() || APF.isInfinity())
+            return SDValue();
+
+          unsigned Width = VT.getScalarSizeInBits();
+          APFloat::roundingMode RM = APFloat::rmNearestTiesToEven;
+          APSInt ResultAPSInt(Width, /*isUnsigned=*/false);
+          bool IsExact = false;
+          APFloat APFcopy = APF;
+
+          if (APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact) == APFloat::opOK) {
+            int64_t Val = ResultAPSInt.getSExtValue();
+            LLVM_DEBUG(dbgs() << "Folded load->int (round): " << Val << "\n");
+            return DAG.getConstant(Val, SDLoc(N), VT);
+          }
+        }
+      }
+    }
+  }
+
+  return SDValue();
+}
+
+static SDValue combineCVTS2UI_RND(SDNode *N, SelectionDAG &DAG,
+                                  const X86Subtarget &Subtarget) {
+  EVT VT = N->getValueType(0);
+  SDValue Src = N->getOperand(0);
+
+  std::cout<<"entered unsigned round "<<std::endl;
+
+  // --- Direct constant float ---
+  if (const ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(Src)) {
+  std::cout<<"entered unsigned round2 "<<std::endl;
+
+    const APFloat &APF = CFP->getValueAPF();
+    if (APF.isNaN() || APF.isInfinity())
+      return SDValue();
+
+    unsigned Width = VT.getScalarSizeInBits();
+    APFloat::roundingMode RM = APFloat::rmNearestTiesToEven;
+
+    APSInt ResultAPSInt(Width, /*isUnsigned=*/true);
+    bool IsExact = false;
+    APFloat APFcopy = APF;
+
+    APFloat::opStatus Status = APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact);
+    if (Status == APFloat::opOK) {
+      uint64_t Val = ResultAPSInt.getZExtValue();
+      LLVM_DEBUG(dbgs() << "Folding float->uint (round) constant: " << Val << "\n");
+      return DAG.getConstant(Val, SDLoc(N), VT);
+    }
+  }
+
+  // --- Load from constant global ---
+  if (LoadSDNode *LD = dyn_cast<LoadSDNode>(Src)) {
+  std::cout<<"entered unsigned round3 "<<std::endl;
+
+    if (GlobalAddressSDNode *GA = dyn_cast<GlobalAddressSDNode>(LD->getBasePtr())) {
+      const GlobalVariable *GV = dyn_cast<GlobalVariable>(GA->getGlobal());
+      if (GV && GV->hasDefinitiveInitializer() && GV->isConstant()) {
+        if (const ConstantFP *CF = dyn_cast<ConstantFP>(GV->getInitializer())) {
+          const APFloat &APF = CF->getValueAPF();
+          if (APF.isNaN() || APF.isInfinity())
+            return SDValue();
+
+          unsigned Width = VT.getScalarSizeInBits();
+          APFloat::roundingMode RM = APFloat::rmNearestTiesToEven;
+          APSInt ResultAPSInt(Width, /*isUnsigned=*/true);
+          bool IsExact = false;
+          APFloat APFcopy = APF;
+
+          if (APFcopy.convertToInteger(ResultAPSInt, RM, &IsExact) == APFloat::opOK) {
+            uint64_t Val = ResultAPSInt.getZExtValue();
+            LLVM_DEBUG(dbgs() << "Folded load->uint (round): " << Val << "\n");
+            return DAG.getConstant(Val, SDLoc(N), VT);
+          }
+        }
+      }
+    }
+  }
+
+  return SDValue();
+}
+
 
 // Custom handling for VCVTTPS2QQS/VCVTTPS2UQQS
 static SDValue combineFP_TO_xINT_SAT(SDNode *N, SelectionDAG &DAG,
@@ -60888,6 +61198,25 @@ SDValue X86TargetLowering::PerformDAGCombine(SDNode *N,
   case X86ISD::STRICT_CVTTP2UI:
   case X86ISD::CVTTP2UI:
                             return combineCVTP2I_CVTTP2I(N, DAG, DCI);
+  case X86ISD::CVTS2SI:
+  case X86ISD::CVTS2UI:
+  case X86ISD::CVTS2SI_RND:
+  case X86ISD::CVTS2UI_RND:
+  case X86ISD::CVTTS2SI:
+  case X86ISD::CVTTS2UI:
+  case X86ISD::CVTTS2SI_SAE:
+  case X86ISD::CVTTS2UI_SAE:
+  case X86ISD::CVTTS2SIS:
+  case X86ISD::CVTTS2UIS:
+  case X86ISD::CVTTS2SIS_SAE:
+  case X86ISD::CVTTS2UIS_SAE:
+  {
+      SDValue Result = ConstantFoldX86FToI(N, DAG);
+      if (Result.getNode())
+          return Result;
+      break;
+  }
+
   case X86ISD::STRICT_CVTPH2PS:
   case X86ISD::CVTPH2PS:    return combineCVTPH2PS(N, DAG, DCI);
   case X86ISD::BT:          return combineBT(N, DAG, DCI);
