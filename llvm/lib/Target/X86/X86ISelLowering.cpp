@@ -2679,7 +2679,10 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
                        ISD::ZERO_EXTEND_VECTOR_INREG,
                        ISD::SINT_TO_FP,
                        ISD::UINT_TO_FP,
-                       ISD::FP_TO_SINT,
+                       ISD::FP_TO_SINT,         
+                       ISD::STRICT_FP_TO_SINT,  
+                       ISD::FP_TO_UINT,         
+                       ISD::STRICT_FP_TO_UINT,  
                        ISD::STRICT_SINT_TO_FP,
                        ISD::STRICT_UINT_TO_FP,
                        ISD::FP_TO_SINT_SAT,
@@ -57366,6 +57369,29 @@ static SDValue combineFPToSInt(SDNode *N, SelectionDAG &DAG,
                                const X86Subtarget &Subtarget) {
   EVT VT = N->getValueType(0);
   SDValue Src = N->getOperand(0);
+  // Check for constant folding first.
+  ConstantFPSDNode *FPC = dyn_cast<ConstantFPSDNode>(N->getOperand(0));
+  if (FPC) {
+    EVT VT = N->getValueType(0);
+    unsigned DstBits = VT.getSizeInBits();
+    const APFloat &FPVal = FPC->getValueAPF();
+    bool IsExact;
+    APFloat::opStatus Status;
+
+    // Perform the conversion using C's "truncate" (round-toward-zero) semantics.
+    APSInt Res(DstBits, /*isUnsigned=*/false);
+    Status = FPVal.convertToInteger(Res, APFloat::rmTowardZero, &IsExact);
+
+    // Only fold if the conversion is valid (opOK) or inexact (opInexact).
+    // Do not fold on overflow or NaN (opInvalidOp), as X86 has
+    // specific behavior for that (returns "integer indefinite").
+    if (Status == APFloat::opOK || Status == APFloat::opInexact)
+      return DAG.getConstant(Res, SDLoc(N), VT);
+    
+    // If conversion failed (overflow, NaN), let the existing
+    // custom lowering logic handle it.
+  }
+  
   if (Subtarget.hasSSE2() && Src.getOpcode() == ISD::FRINT &&
       VT.getScalarType() == MVT::i32 && Src.hasOneUse())
     return DAG.getNode(ISD::LRINT, SDLoc(N), VT, Src.getOperand(0));
