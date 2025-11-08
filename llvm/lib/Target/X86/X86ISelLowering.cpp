@@ -57391,13 +57391,78 @@ static SDValue combineFPToSInt(SDNode *N, SelectionDAG &DAG,
     // If conversion failed (overflow, NaN), let the existing
     // custom lowering logic handle it.
   }
+
   
+
   if (Subtarget.hasSSE2() && Src.getOpcode() == ISD::FRINT &&
       VT.getScalarType() == MVT::i32 && Src.hasOneUse())
     return DAG.getNode(ISD::LRINT, SDLoc(N), VT, Src.getOperand(0));
 
   return SDValue();
 }
+
+static SDValue combineFPToUInt(SDNode *N, SelectionDAG &DAG,
+                                const X86Subtarget &){
+
+ ConstantFPSDNode *FPC = dyn_cast<ConstantFPSDNode>(N->getOperand(0));
+  if (FPC) {
+    EVT VT = N->getValueType(0);
+    unsigned DstBits = VT.getSizeInBits();
+    const APFloat &FPVal = FPC->getValueAPF();
+    bool IsExact;
+    APFloat::opStatus Status;
+
+    // Perform the conversion using C's "truncate" (round-toward-zero) semantics.
+    APInt Res(DstBits, 0);
+    Status = FPVal.convertToInteger(Res, APFloat::rmTowardZero, &IsExact);
+
+    if (Status == APFloat::opOK || Status == APFloat::opInexact)
+      return DAG.getConstant(Res, SDLoc(N), VT);
+  }                     
+  return SDValue();
+}
+
+static SDValue combineStrictFPToSInt(SDNode *N, SelectionDAG &DAG,
+                                     const X86Subtarget &Subtarget){
+                                      ConstantFPSDNode *FPC = dyn_cast<ConstantFPSDNode>(N->getOperand(1));
+  if (FPC) {
+    EVT VT = N->getValueType(0);
+    unsigned DstBits = VT.getSizeInBits();
+    const APFloat &FPVal = FPC->getValueAPF();
+    bool IsExact;
+    APFloat::opStatus Status;
+
+    APSInt Res(DstBits, false);
+    Status = FPVal.convertToInteger(Res, APFloat::rmTowardZero, &IsExact);
+
+    // For STRICT, we can only fold if the conversion is valid AND exact.
+    if (Status == APFloat::opOK && IsExact)
+      return DAG.getMergeValues({DAG.getConstant(Res, SDLoc(N), VT), N->getOperand(0)});
+  }
+  return SDValue();
+
+}
+
+static SDValue combineStrictFPToUInt(SDNode *N, , SelectionDAG &DAG,
+                                     const X86Subtarget &Subtarget){
+                                      ConstantFPSDNode *FPC = dyn_cast<ConstantFPSDNode>(N->getOperand(1));
+  if (FPC) {
+    EVT VT = N->getValueType(0);
+    unsigned DstBits = VT.getSizeInBits();
+    const APFloat &FPVal = FPC->getValueAPF();
+    bool IsExact;
+    APFloat::opStatus Status;
+
+    APInt Res(DstBits, 0);
+    Status = FPVal.convertToInteger(Res, APFloat::rmTowardZero, &IsExact);
+
+    // For STRICT, we can only fold if the conversion is valid AND exact.
+    if (Status == APFloat::opOK && IsExact)
+      return DAG.getMergeValues({DAG.getConstant(Res, SDLoc(N), VT), N->getOperand(0)});
+}
+  return SDValue();
+}       
+
 
 // Custom handling for VCVTTPS2QQS/VCVTTPS2UQQS
 static SDValue combineFP_TO_xINT_SAT(SDNode *N, SelectionDAG &DAG,
@@ -60887,6 +60952,11 @@ SDValue X86TargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::STRICT_UINT_TO_FP:
     return combineUIntToFP(N, DAG, Subtarget);
   case ISD::FP_TO_SINT:     return combineFPToSInt(N, DAG, Subtarget);
+  case ISD::FP_TO_UINT:     return combineFPToUInt(N, DAG, Subtarget);
+  case ISD::STRICT_FP_TO_SINT:
+    return combineStrictFPToSInt(N, DAG, Subtarget);
+  case ISD::STRICT_FP_TO_UINT:
+    return combineStrictFPToUInt(N, DAG, Subtarget);
   case ISD::LRINT:
   case ISD::LLRINT:         return combineLRINT_LLRINT(N, DAG, Subtarget);
   case ISD::FADD:
